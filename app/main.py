@@ -1,59 +1,138 @@
-from fastapi import FastAPI
+# app/main.py
+
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import pickle
 import re
+import torch
+from transformers import BertTokenizer, BertForSequenceClassification
 
-app = FastAPI(title="Citizen Grievance NLP API", version="1.0")
+# ─────────────────────────────────────────────
+# App Setup
+# ─────────────────────────────────────────────
+app = FastAPI(
+    title="Citizen Grievance NLP API",
+    description="Automatically routes citizen complaints to the correct department and scores urgency.",
+    version="1.0.0"
+)
 
-# --- Load models at startup ---
+# ─────────────────────────────────────────────
+# Load All Models at Startup
+# ─────────────────────────────────────────────
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+# Department models
 with open('../models/tfidf_vectorizer.pkl', 'rb') as f:
     tfidf_dept = pickle.load(f)
 with open('../models/dept_classifier.pkl', 'rb') as f:
     dept_model = pickle.load(f)
-with open('../models/tfidf_sentiment.pkl', 'rb') as f:
-    tfidf_sent = pickle.load(f)
-with open('../models/sentiment_classifier.pkl', 'rb') as f:
-    sent_model = pickle.load(f)
 
-# --- Priority map ---
+# BERT sentiment model
+tokenizer   = BertTokenizer.from_pretrained('../models/bert_sentiment/')
+bert_model  = BertForSequenceClassification.from_pretrained('../models/bert_sentiment/')
+bert_model.to(device)
+bert_model.eval()
+
+# Label encoder
+with open('../models/label_encoder.pkl', 'rb') as f:
+    le = pickle.load(f)
+
+# ─────────────────────────────────────────────
+# Priority Score Mapping
+# ─────────────────────────────────────────────
 PRIORITY_MAP = {
-    'Positive': 1,
-    'Neutral': 2,
-    'Negative': 3,
+    'Positive':        1,
+    'Neutral':         2,
+    'Negative':        3,
     'Critical/Urgent': 5
 }
 
-# --- Request schema ---
+PRIORITY_LABEL = {
+    1: "Low",
+    2: "Medium",
+    3: "High",
+    5: "Critical — Immediate Action Required"
+}
+
+# ─────────────────────────────────────────────
+# Request & Response Schemas
+# ─────────────────────────────────────────────
 class GrievanceRequest(BaseModel):
     complaint: str
 
-# --- Text cleaner ---
-def clean(text: str) -> str:
-    text = text.lower()
-    text = re.sub(r'[^a-z\s]', '', text)
-    return text
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "complaint": "There is no water supply in our area since 10 days. Children are falling sick."
+            }
+        }
 
-# --- Endpoints ---
+class GrievanceResponse(BaseModel):
+    complaint:            str
+    predicted_department: str
+    sentiment:            str
+    priority_score:       int
+    priority_label:       str
+
+# ─────────────────────────────────────────────
+# Helper Functions
+# ─────────────────────────────────────────────
+def clean_text(text: str) -> str:
+    text = text.lower()
+    text = re.sub(r'http\S+|www\S+', '', text)
+    text = re.sub(r'[^a-z\s]', '', text)
+    return text.strip()
+
+def predict_department(clean: str) -> str:
+    vec  = tfidf_dept.transform([clean])
+    return dept_model.predict(vec)[0]
+
+def predict_sentiment(clean: str) -> str:
+    enc = tokenizer(
+        [clean],
+        padding=True,
+        truncation=True,
+        max_length=64,
+        return_tensors='pt'
+    )
+    input_ids      = enc['input_ids'].to(device)
+    attention_mask = enc['attention_mask'].to(device)
+
+    with torch.no_grad():
+        output = bert_model(input_ids=input_ids, attention_mask=attention_mask)
+
+    pred_idx = torch.argmax(output.logits, dim=1).item()
+    return le.inverse_transform([pred_idx])[0]
+
+# ─────────────────────────────────────────────
+# API Endpoints
+# ─────────────────────────────────────────────
 @app.get("/")
 def root():
-    return {"message": "Grievance NLP API is running!"}
-
-@app.post("/predict")
-def predict(req: GrievanceRequest):
-    cleaned = clean(req.complaint)
-
-    # Department prediction
-    dept_vec  = tfidf_dept.transform([cleaned])
-    department = dept_model.predict(dept_vec)[0]
-
-    # Sentiment prediction
-    sent_vec  = tfidf_sent.transform([cleaned])
-    sentiment = sent_model.predict(sent_vec)[0]
-    priority  = PRIORITY_MAP.get(sentiment, 2)
-
     return {
-        "complaint": req.complaint,
-        "predicted_department": department,
-        "sentiment": sentiment,
-        "priority_score": priority
+        "message": "Citizen Grievance NLP API is live!",
+        "docs":    "Visit /docs for interactive API documentation"
     }
+
+@app.get("/health")
+def health():
+    return {"status": "healthy", "models_loaded": True}
+
+@app.post("/predict", response_model=GrievanceResponse)
+def predict(req: GrievanceRequest):
+    if not req.complaint.strip():
+        raise HTTPException(status_code=400, detail="Complaint text cannot be empty.")
+
+    cleaned    = clean_text(req.complaint)
+    department = predict_department(cleaned)
+    sentiment  = predict_sentiment(cleaned)
+    score      = PRIORITY_MAP.get(sentiment, 2)
+    label      = PRIORITY_LABEL.get(score, "Medium")
+
+    return GrievanceResponse(
+        complaint=req.complaint,
+        predicted_department=department,
+        sentiment=sentiment,
+        priority_score=score,
+        priority_label=label
+    )
